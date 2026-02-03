@@ -1,32 +1,65 @@
 import express from "express";
 import getPlcData from "../PlcHelper.js";
+import { insertPlcData } from "../MongoHelper.js";
 
 const router = express.Router();
-let latestPlcData = null;
 
-// Function to continuously read PLC
+let latestPlcData = null;
+let lastInsertedData = null;
+let _pollingStarted = false;
+
 async function readLoop() {
-  const data = await getPlcData();
-  if (data) {
-    latestPlcData = data; // store latest data
-    console.log("PLC Data:", data);
+  try {
+    const data = await getPlcData();
+
+    if (!data) {
+      return setTimeout(readLoop, 2000);
+    }
+
+    latestPlcData = data;
+
+    // Compare simple fields; adjust keys as needed for your PLC payload
+    const hasChanged =
+      !lastInsertedData ||
+      Object.keys(data).some((k) => {
+        if (k === "timestamp") return false;
+        return data[k] !== lastInsertedData[k];
+      });
+
+    if (hasChanged) {
+      console.log("📈 PLC Data Changed:", data);
+      try {
+        await insertPlcData({ ...data, timestamp: new Date() });
+        lastInsertedData = { ...data };
+      } catch (err) {
+        console.error("MongoDB insert failed:", err.message);
+      }
+    }
+
+  } catch (err) {
+    console.error("Read loop error:", err.message);
   }
-  setTimeout(readLoop, 2000); // repeat every 2 seconds
+
+  setTimeout(readLoop, 2000);
 }
 
-// Start reading loop
-readLoop();
+export function startPlcPolling() {
+  if (_pollingStarted) return;
+  _pollingStarted = true;
+  readLoop();
+}
 
-// Simple API to get the latest PLC data
+/* ------------------ API ENDPOINTS ------------------ */
+
 router.get("/latest", (req, res) => {
   if (!latestPlcData) {
     return res.status(503).json({ message: "PLC data not available yet" });
   }
   res.json(latestPlcData);
 });
-// Simple route to check API status
+
 router.get("/status", (req, res) => {
-  res.json({ status: "PLC API is running" });
+  res.json({ status: "PLC API running" });
 });
 
 export default router;

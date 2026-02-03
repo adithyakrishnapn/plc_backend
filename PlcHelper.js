@@ -12,17 +12,34 @@ async function connectPLC() {
   }
 }
 
+const STATUS_MAP = ["STOPPED", "RUNNING", "IDLE", "FAULT"];
+
 async function getPlcData() {
   try {
     await connectPLC();
 
-    const res = await client.readHoldingRegisters(0, 2);
+    // Read D100 → D109
+    const res = await client.readHoldingRegisters(100, 10);
+    const d = res.data;
 
     return {
-      temperature: res.data[0],
-      pressure: res.data[1],
+      machineStatus: STATUS_MAP[d[0]],
+      shiftWorkingHours: (d[1] / 3600).toFixed(1),
+      totalUptimeHours: (d[2] / 3600).toFixed(1),
+
+      todayProduction: d[3],
+      totalProduction: d[4],
+
+      fabricLengthMeters: (d[5] / 100).toFixed(2),
+      machineSpeed: d[6] / 10,
+
+      utilizationPercent: d[7],
+      downtimeMinutes: (d[8] / 60).toFixed(1),
+
+      alarmCode: d[9],
       timestamp: new Date()
     };
+
   } catch (err) {
     isConnected = false;
     console.error("PLC Error:", err.message);
