@@ -1,27 +1,20 @@
 import express from "express";
-import plcRoutes, { startPlcPolling } from "./Routes/PlcRoutes.js";
-import { connectMongo } from "./MongoHelper.js";
-import dotenv from "dotenv";
-import cors from "cors";
+import plcRoutes from "./Routes/PlcRoutes.js";
+import { testPlcConnection } from "./PlcHelper.js";
+
 const app = express();
 const PORT = 3000;
-dotenv.config()
 
-app.use(cors());
-// Store latest PLC data
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-// Start Express server
-app.use('/plc', plcRoutes);
-// Connect to MongoDB first, then start server and polling
-try {
-  await connectMongo();
-} catch (err) {
-  console.warn("MongoDB not connected on startup:", err.message);
-}
+app.use("/plc", plcRoutes);
 
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-  // Start PLC polling after server is listening
-  startPlcPolling();
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+
+  // Test PLC connection on startup
+  const plcOk = await testPlcConnection();
+
+  if (!plcOk) {
+    console.log("⚠️ PLC connection failed. Check IP / Network.");
+  }
 });
