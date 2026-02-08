@@ -1,5 +1,5 @@
 import express from "express";
-import getPlcData from "../PlcHelper.js";
+import getPlcData, { sendDefectTrigger } from "../PlcHelper.js";
 import { insertPlcData } from "../MongoHelper.js";
 
 const router = express.Router();
@@ -18,22 +18,19 @@ async function readLoop() {
 
     latestPlcData = data;
 
-    // Compare simple fields; adjust keys as needed for your PLC payload
+    // Insert only if something important changed
     const hasChanged =
       !lastInsertedData ||
-      Object.keys(data).some((k) => {
-        if (k === "timestamp") return false;
-        return data[k] !== lastInsertedData[k];
-      });
+      data.machineStatusCode !== lastInsertedData.machineStatusCode ||
+      data.totalProduction !== lastInsertedData.totalProduction ||
+      data.fabricLength !== lastInsertedData.fabricLength ||
+      data.alarmCode !== lastInsertedData.alarmCode ||
+      data.stampComplete !== lastInsertedData.stampComplete;
 
     if (hasChanged) {
-      console.log("📈 PLC Data Changed:", data);
-      try {
-        await insertPlcData({ ...data, timestamp: new Date() });
-        lastInsertedData = { ...data };
-      } catch (err) {
-        console.error("MongoDB insert failed:", err.message);
-      }
+      console.log("📈 PLC Update:", data);
+      await insertPlcData(data);
+      lastInsertedData = { ...data };
     }
 
   } catch (err) {
@@ -49,7 +46,7 @@ export function startPlcPolling() {
   readLoop();
 }
 
-/* ------------------ API ENDPOINTS ------------------ */
+/* -------- API -------- */
 
 router.get("/latest", (req, res) => {
   if (!latestPlcData) {
@@ -58,8 +55,20 @@ router.get("/latest", (req, res) => {
   res.json(latestPlcData);
 });
 
-router.get("/status", (req, res) => {
-  res.json({ status: "PLC API running" });
+router.post("/defect", async (req, res) => {
+  const success = await sendDefectTrigger();
+
+  if (!success) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send defect trigger",
+    });
+  }
+
+  res.json({
+    success: true,
+    message: "Defect trigger sent to PLC",
+  });
 });
 
 export default router;

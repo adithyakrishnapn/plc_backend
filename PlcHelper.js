@@ -1,14 +1,25 @@
 import ModbusRTU from "modbus-serial";
 
 const client = new ModbusRTU();
+
+const PLC_IP = "192.168.1.50";
+const PLC_PORT = 502;
+
 let isConnected = false;
 
+client.setTimeout(2000);
+
 async function connectPLC() {
-  if (!isConnected) {
-    await client.connectTCP("192.168.1.50", { port: 502 });
-    client.setID(1);
-    isConnected = true;
-    console.log("Connected to PLC");
+  try {
+    if (!isConnected || !client.isOpen) {
+      await client.connectTCP(PLC_IP, { port: PLC_PORT });
+      isConnected = true;
+      console.log("✅ Connected to PLC");
+    }
+  } catch (err) {
+    isConnected = false;
+    console.error("❌ Connection Error:", err.message);
+    throw err;
   }
 }
 
@@ -18,32 +29,56 @@ async function getPlcData() {
   try {
     await connectPLC();
 
-    // Read D100 → D109
-    const res = await client.readHoldingRegisters(100, 10);
+    // Read D100 → D112 (13 registers)
+    const res = await client.readHoldingRegisters(100, 13);
     const d = res.data;
 
     return {
-      machineStatus: STATUS_MAP[d[0]],
-      shiftWorkingHours: (d[1] / 3600).toFixed(1),
-      totalUptimeHours: (d[2] / 3600).toFixed(1),
+      machineStatusCode: d[0],
+      machineStatus: STATUS_MAP[d[0]] || "UNKNOWN",
 
-      todayProduction: d[3],
-      totalProduction: d[4],
+      totalProduction: d[1],     // D101
+      alarmCode: d[2],           // D102
+      fabricLength: d[3],        // D103 (meters or mm based on PLC)
 
-      fabricLengthMeters: (d[5] / 100).toFixed(2),
-      machineSpeed: d[6] / 10,
+      machineRunning: d[10],     // D110 (0/1)
+      defectTrigger: d[11],      // D111 (for monitoring)
+      stampComplete: d[12],      // D112
 
-      utilizationPercent: d[7],
-      downtimeMinutes: (d[8] / 60).toFixed(1),
-
-      alarmCode: d[9],
       timestamp: new Date()
     };
 
   } catch (err) {
     isConnected = false;
-    console.error("PLC Error:", err.message);
+    console.error("❌ PLC Read Error:", err.message);
     return null;
+  }
+}
+
+/* ----------- WRITE: AI DEFECT → PLC ----------- */
+export async function sendDefectTrigger() {
+  try {
+    await connectPLC();
+
+    // Write 1 to D111
+    await client.writeRegister(111, 1);
+
+    console.log("🚨 Defect trigger sent (D111)");
+    return true;
+  } catch (err) {
+    console.error("❌ PLC Write Error:", err.message);
+    return false;
+  }
+}
+
+/* Optional: reset trigger after PLC action */
+export async function resetDefectTrigger() {
+  try {
+    await connectPLC();
+    await client.writeRegister(111, 0);
+    return true;
+  } catch (err) {
+    return false;
   }
 }
 
