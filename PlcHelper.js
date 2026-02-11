@@ -60,7 +60,6 @@ export async function getPlcData() {
     };
 
   } catch (err) {
-    isConnected = false;
     console.error("❌ PLC Read Error:", err.message);
     return null;
   }
