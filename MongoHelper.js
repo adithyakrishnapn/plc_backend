@@ -1,55 +1,37 @@
-import { MongoClient } from "mongodb";
+import mongoose from "mongoose";
 
-let _client = null;
-let _connected = false;
+const plcSchema = new mongoose.Schema({
+  type: String,
 
+  processId: String,
+  textileId: String,
 
-export async function connectMongo() {
-  const envUri = process.env.MONGODB_URI;
-  if (!envUri) {
-    console.warn("No MongoDB URI could be constructed from environment variables.");
-    throw new Error("MONGODB connection info missing");
-  }
+  machineStatusCode: Number,
+  machineStatus: String,
+  machineRunning: Number,
 
-  if (!_client) {
-    _client = new MongoClient(envUri, { maxPoolSize: 10 });
-  }
+  totalProduction: Number,
+  fabricLength: Number,
+  alarmCode: Number,
 
-  if (!_connected) {
-    await _client.connect();
-    _connected = true;
-    console.log("Connected to MongoDB");
-  }
+  count: Number,
+  lengthAtDetection: Number,
 
-  return _client;
-}
+  startTime: Date,
+  endTime: Date,
+  durationMinutes: Number,
+  production: Number,
+  fabricProcessed: Number,
 
-async function ensureConnected() {
-  if (!_connected) {
-    await connectMongo();
-  }
-  return _client;
-}
+  timestamp: { type: Date, default: Date.now }
+});
 
-export async function insertPlcData(doc) {
-  const c = await ensureConnected();
-  const dbName = process.env.MONGODB_DB || "plcdb";
-  const coll = process.env.MONGODB_COLLECTION || "plcdata";
-  const db = c.db(dbName);
-  const res = await db.collection(coll).insertOne(doc);
-  return res;
-}
+export const PlcModel = mongoose.model("PlcData", plcSchema);
 
-export async function closeMongo() {
-  if (_connected && _client) {
-    await _client.close();
-    _connected = false;
-    _client = null;
+export async function insertPlcData(data) {
+  try {
+    await PlcModel.create(data);
+  } catch (err) {
+    console.error("Mongo Insert Error:", err.message);
   }
 }
-
-export function isMongoConnected() {
-  return _connected;
-}
-
-export default { connectMongo, insertPlcData, closeMongo, isMongoConnected };
