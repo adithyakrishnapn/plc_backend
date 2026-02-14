@@ -76,37 +76,38 @@ async function handleProcessLogic(data) {
   lastProcessStart = data.processStart;
 }
 
-/* ---------------- AI LOGIC ---------------- */
+/* ---------------- AI LOGIC (Receives POST from Python) ---------- */
 
-async function handleAI(data) {
+async function handleDetectResult(defectData) {
+  // defectData = { defect: true, count: N, timestamp: T }
+  
+  if (!currentProcess) {
+    console.log("⚠️ Defect received but no active process");
+    return;
+  }
+  
+  if (latestPlcData && latestPlcData.machineRunning !== 1) {
+    console.log("⚠️ Defect received but machine not running");
+    return;
+  }
 
-  if (!currentProcess) return;
-  if (data.machineRunning !== 1) return;
-  if (data.fabricLength <= lastLengthForAI) return;
-
-  lastLengthForAI = data.fabricLength;
+  const { count } = defectData;
+  
+  console.log("❗ Defect Detected:", count);
 
   try {
-    const res = await axios.get("http://localhost:5000/detect");
-    const { defect, count } = res.data;
+    await sendDefectTrigger();
 
-    if (defect) {
-      console.log("❗ Defect:", count);
-
-      await sendDefectTrigger();
-
-      await insertPlcData({
-        type: "defect",
-        processId: currentProcess.processId,
-        textileId: currentProcess.textileId,
-        count,
-        lengthAtDetection: data.fabricLength,
-        timestamp: new Date()
-      });
-    }
-
+    await insertPlcData({
+      type: "defect",
+      processId: currentProcess.processId,
+      textileId: currentProcess.textileId,
+      count,
+      lengthAtDetection: latestPlcData?.fabricLength || null,
+      timestamp: new Date()
+    });
   } catch (err) {
-    console.error("AI Error:", err.message);
+    console.error("Defect Handler Error:", err.message);
   }
 }
 
@@ -119,9 +120,10 @@ async function readLoop() {
 
     latestPlcData = data;
 
+    // Handle process start/end logic
     await handleProcessLogic(data);
-    await handleAI(data);
 
+    // Save telemetry on important changes
     if (hasImportantChange(data)) {
       await insertPlcData({
         type: "telemetry",
@@ -147,13 +149,36 @@ export function startPlcPolling() {
   readLoop();
 }
 
-/* ---------------- API ---------------- */
+/* ---------------- API ENDPOINTS ---------------- */
 
+// Get latest PLC data
 router.get("/latest", (req, res) => {
   if (!latestPlcData) {
     return res.status(503).json({ message: "No data yet" });
   }
   res.json(latestPlcData);
+});
+
+// Receive defect detection result from Python AI server
+router.post("/detect-result", async (req, res) => {
+  const { defect, count, timestamp } = req.body;
+
+  if (!defect) {
+    return res.status(400).json({ message: "No defect in request" });
+  }
+
+  // Handle the defect result
+  await handleDetectResult({
+    defect,
+    count,
+    timestamp
+  });
+
+  res.json({
+    success: true,
+    message: "Defect processed",
+    processId: currentProcess?.processId || null
+  });
 });
 
 export default router;
