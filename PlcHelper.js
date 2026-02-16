@@ -5,7 +5,7 @@ dotenv.config();
 
 const client = new ModbusRTU();
 
-const PLC_IP = process.env.PLC_IP || "192.168.1.50";
+const PLC_IP = process.env.PLC_IP || "192.168.1.1";
 const PLC_PORT = Number(process.env.PLC_PORT) || 502;
 
 let isConnected = false;
@@ -14,7 +14,7 @@ client.setTimeout(2000);
 // --------------------
 // PLC Connection
 // --------------------
-async function connectPLC() {
+export async function connectPLC() {
   try {
     if (!isConnected || !client.isOpen) {
       await client.connectTCP(PLC_IP, { port: PLC_PORT });
@@ -26,6 +26,15 @@ async function connectPLC() {
     console.error("❌ PLC Connection Error:", err.message);
     throw err;
   }
+}
+
+// Test connection status
+export function getConnectionStatus() {
+  return {
+    isConnected,
+    ip: PLC_IP,
+    port: PLC_PORT
+  };
 }
 
 // --------------------

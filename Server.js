@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 
 import plcRoutes, { startPlcPolling } from "./Routes/PlcRoutes.js";
+import testDataRoutes from "./Routes/TestDataRoutes.js";
 
 // Load environment variables
 dotenv.config();
@@ -18,6 +19,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Routes
 app.use("/plc", plcRoutes);
+app.use("/test-data", testDataRoutes);
 
 // --------------------
 // MongoDB Connection (Mongoose)
