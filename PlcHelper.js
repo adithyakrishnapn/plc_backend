@@ -7,24 +7,96 @@ const client = new ModbusRTU();
 
 const PLC_IP = process.env.PLC_IP || "192.168.1.1";
 const PLC_PORT = Number(process.env.PLC_PORT) || 502;
+const PLC_UNIT_ID = Number(process.env.PLC_UNIT_ID) || 1;  // Default Unit ID = 1
 
 let isConnected = false;
-client.setTimeout(2000);
+let connectionAttempts = 0;
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY = 1000; // 1 second between retries
+
+// Simple mutex to ensure ALL Modbus operations are serialized over a single TCP connection.
+// This prevents overlapping read/write requests which many PLCs and the modbus-serial client
+// do not handle well.
+let plcLock = Promise.resolve();
+
+function withPlcLock(fn) {
+  const run = plcLock.then(() => fn());
+
+  // Ensure the chain continues even if an operation fails
+  plcLock = run.catch(() => {});
+
+  return run;
+}
+
+// Increase timeout to 5 seconds for better reliability
+client.setTimeout(5000);
+client.setMaxListeners(20);
 
 // --------------------
-// PLC Connection
+// PLC Connection with Persistent Connection (No Reconnect)
 // --------------------
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function connectPLC() {
   try {
-    if (!isConnected || !client.isOpen) {
-      await client.connectTCP(PLC_IP, { port: PLC_PORT });
-      isConnected = true;
-      console.log(`✅ PLC Connected to ${PLC_IP}:${PLC_PORT}`);
+    // ✅ Keep connection open - don't reconnect if already connected
+    if (isConnected && client.isOpen) {
+      return;  // Reuse existing persistent connection
     }
+
+    // Try to connect with retry logic (only on first attempt)
+    for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+      try {
+        console.log(`🔌 PLC Connection Attempt ${attempt}/${MAX_RETRY_ATTEMPTS}...`);
+        
+        await client.connectTCP(PLC_IP, { 
+          port: PLC_PORT,
+          timeout: 5000  // Timeout for this initial connection only
+        });
+        
+        // ✅ Set Unit ID after TCP connection
+        client.setID(PLC_UNIT_ID);
+        console.log(`   Unit ID set to: ${PLC_UNIT_ID}`);
+        
+        isConnected = true;
+        connectionAttempts = 0;
+        console.log(`✅ PLC Connected PERSISTENTLY to ${PLC_IP}:${PLC_PORT} (Unit ID: ${PLC_UNIT_ID})`);
+        console.log(`   ⚡ Connection will stay open for operations (no reconnect)`);
+        return;
+        
+      } catch (err) {
+        console.warn(`⚠️ Connection attempt ${attempt} failed: ${err.message}`);
+        
+        if (attempt < MAX_RETRY_ATTEMPTS) {
+          console.log(`⏳ Retrying in ${RETRY_DELAY}ms...`);
+          await delay(RETRY_DELAY);
+        } else {
+          isConnected = false;
+          throw new Error(`Failed to connect after ${MAX_RETRY_ATTEMPTS} attempts: ${err.message}`);
+        }
+      }
+    }
+
   } catch (err) {
     isConnected = false;
-    console.error("❌ PLC Connection Error:", err.message);
+    connectionAttempts++;
+    console.error(`❌ PLC Connection Error: ${err.message}`);
     throw err;
+  }
+}
+
+// Gracefully close connection
+export async function disconnectPLC() {
+  try {
+    if (client.isOpen) {
+      await client.close();
+      isConnected = false;
+      console.log("✅ PLC Connection Closed");
+    }
+  } catch (err) {
+    console.error("⚠️ Error closing PLC connection:", err.message);
   }
 }
 
@@ -43,63 +115,156 @@ export function getConnectionStatus() {
 const STATUS_MAP = ["STOPPED", "RUNNING", "IDLE", "FAULT"];
 
 // --------------------
-// READ PLC DATA
+// READ PLC DATA with Retry Logic
 // --------------------
 export async function getPlcData() {
-  try {
-    await connectPLC();
+  return withPlcLock(async () => {
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await connectPLC();
 
-    // Read D100 to D111
-    const res = await client.readHoldingRegisters(100, 12);
-    const d = res.data;
+      // ✅ EFFICIENT: Read all 12 registers in one Modbus command (D100-D111)
+      // Non-blocking architecture handles any register delays gracefully
+      const res = await client.readHoldingRegisters(100, 12);
+      const data = res.data;
 
-    return {
-      machineStatusCode: d[0],        // D100
-      machineStatus: STATUS_MAP[d[0]] || "UNKNOWN",
+      return {
+        machineStatusCode: data[0],    // D100
+        machineStatus: STATUS_MAP[data[0]] || "UNKNOWN",
+        totalProduction: data[1],      // D101
+        alarmCode: data[2],            // D102
+        fabricLength: data[3],         // D103
+        processStart: data[6],         // D106
+        machineRunning: data[10],      // D110
+        defectRegister: data[11],      // D111
+        timestamp: new Date()
+      };
 
-      totalProduction: d[1],          // D101
-      alarmCode: d[2],                // D102
-      fabricLength: d[3],             // D103
+    } catch (err) {
+      lastError = err;
+      console.error(`⚠️ PLC Read attempt ${attempt} failed: ${err.message}`);
 
-      processStart: d[6],             // D106 (Start Trigger)
-      machineRunning: d[10],          // D110
-      defectRegister: d[11],          // D111
+      // Only mark as disconnected if the underlying TCP socket is actually closed.
+      if (!client.isOpen) {
+        isConnected = false;
+      }
 
-      timestamp: new Date()
-    };
-
-  } catch (err) {
-    console.error("❌ PLC Read Error:", err.message);
-    return null;
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        console.log(`⏳ Retrying read in ${RETRY_DELAY}ms...`);
+        await delay(RETRY_DELAY);
+      }
+    }
   }
+  
+  console.error(`❌ PLC Read Error after ${MAX_RETRY_ATTEMPTS} attempts:`, lastError.message);
+  return null;
+  });
 }
 
 // --------------------
-// WRITE DEFECT TRIGGER
+// WRITE DEFECT TRIGGER with Retry Logic
 // --------------------
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 export async function sendDefectTrigger() {
-  try {
-    await connectPLC();
+  return withPlcLock(async () => {
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await connectPLC();
 
-    await client.writeRegister(111, 1);
-    console.log("🚨 D111 = 1");
+      await client.writeRegister(111, 1);
+      console.log("🚨 DEFECT DETECTED: D111 = 1");
 
-    await delay(500);
+      // Wait 2 seconds before resetting
+      await delay(2000);
 
-    await client.writeRegister(111, 0);
-    console.log("✅ D111 = 0");
+      await client.writeRegister(111, 0);
+      console.log("✅ DEFECT CLEARED: D111 = 0");
 
-    return true;
+      return true;
 
-  } catch (err) {
-    isConnected = false;
-    console.error("❌ PLC Write Error:", err.message);
-    return false;
+    } catch (err) {
+      lastError = err;
+      console.error(`⚠️ PLC Write attempt ${attempt} failed: ${err.message}`);
+
+      // Only mark as disconnected if the underlying TCP socket is actually closed.
+      if (!client.isOpen) {
+        isConnected = false;
+      }
+
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        console.log(`⏳ Retrying write in ${RETRY_DELAY}ms...`);
+        await delay(RETRY_DELAY);
+      }
+    }
   }
+  
+  console.error(`❌ PLC Write Error after ${MAX_RETRY_ATTEMPTS} attempts:`, lastError.message);
+  return false;
+  });
+}
+
+// Set defect register to 1 only (for testing)
+export async function sendDefectTriggerSetOne() {
+  return withPlcLock(async () => {
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await connectPLC();
+      await client.writeRegister(111, 1);
+      console.log("🚨 TEST: D111 = 1");
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.error(`⚠️ Write attempt ${attempt} failed: ${err.message}`);
+
+      if (!client.isOpen) {
+        isConnected = false;
+      }
+      
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        await delay(RETRY_DELAY);
+      }
+    }
+  }
+  
+  console.error("❌ Failed to set D111 = 1 after retries");
+  return false;
+  });
+}
+
+// Set defect register to 0 only (for testing)
+export async function sendDefectTriggerSetZero() {
+  return withPlcLock(async () => {
+  let lastError = null;
+  
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await connectPLC();
+      await client.writeRegister(111, 0);
+      console.log("✅ TEST: D111 = 0");
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.error(`⚠️ Write attempt ${attempt} failed: ${err.message}`);
+
+      if (!client.isOpen) {
+        isConnected = false;
+      }
+      
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        await delay(RETRY_DELAY);
+      }
+    }
+  }
+  
+  console.error("❌ Failed to set D111 = 0 after retries");
+  return false;
+  });
 }
 
 // --------------------

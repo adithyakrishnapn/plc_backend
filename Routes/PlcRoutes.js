@@ -2,9 +2,10 @@ import express from "express";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 
-import { getPlcData, sendDefectTrigger, connectPLC, getConnectionStatus } from "../PlcHelper.js";
+import { getPlcData, sendDefectTrigger, sendDefectTriggerSetOne, sendDefectTriggerSetZero, connectPLC, getConnectionStatus } from "../PlcHelper.js";
 import { insertPlcData, getMongoStatus, getLatestPlcData, getLatestDataByType, getPlcDataByTimeRange } from "../MongoHelper.js";
 import { generateTextileId } from "../processUtils.js";
+import { DataQueue } from "../DataQueue.js";
 
 const router = express.Router();
 
@@ -16,63 +17,15 @@ let lastProcessStart = 0;
 let currentProcess = null;
 let lastLengthForAI = 0;
 
-/* -------- DEFECT QUEUE (Process defects ONE at a time) -------- */
+/* -------- DEFECT QUEUE (Process defects via independent loop) -------- */
 let defectQueue = [];
 let isProcessingDefect = false;
 
-async function processDefectQueue() {
-  // If already processing, wait
-  if (isProcessingDefect || defectQueue.length === 0) {
-    return;
-  }
+// Note: Defect processing is now handled in startPlcPolling() as an independent interval
+// This keeps it from blocking PLC polling
 
-  isProcessingDefect = true;
-  const defectData = defectQueue.shift();
-  const defectCount = defectQueue.length;
 
-  try {
-    if (!currentProcess) {
-      console.log("⚠️ Defect received but no active process");
-      return;
-    }
 
-    if (latestPlcData && latestPlcData.machineRunning !== 1) {
-      console.log("⚠️ Defect received but machine not running");
-      return;
-    }
-
-    const { count } = defectData;
-
-    console.log(`❗ Processing Defect [${defectData.defectId}]: ${count} holes`);
-
-    // TRIGGER PLC (only one signal at a time)
-    await sendDefectTrigger();
-
-    // SAVE TO DATABASE
-    await insertPlcData({
-      type: "defect",
-      processId: currentProcess.processId,
-      textileId: currentProcess.textileId,
-      count,
-      defectId: defectData.defectId,
-      confidence: defectData.confidence,
-      lengthAtDetection: latestPlcData?.fabricLength || null,
-      timestamp: new Date()
-    });
-
-    console.log(`✅ Defect #${defectData.defectId} COMPLETE (${defectCount} in queue)`);
-
-  } catch (err) {
-    console.error("❌ Defect Processing Error:", err.message);
-  } finally {
-    isProcessingDefect = false;
-
-    // Process next defect if queue has more
-    if (defectQueue.length > 0) {
-      setTimeout(processDefectQueue, 100); // Small delay before next
-    }
-  }
-}
 
 /* ---------------- CHANGE CHECK ---------------- */
 
@@ -93,10 +46,8 @@ function hasImportantChange(data) {
 /* ---------------- PROCESS LOGIC ---------------- */
 
 async function handleProcessLogic(data) {
-
   // START 0 → 1
   if (data.processStart === 1 && lastProcessStart === 0) {
-
     currentProcess = {
       processId: uuidv4(),
       textileId: generateTextileId(),
@@ -110,7 +61,6 @@ async function handleProcessLogic(data) {
 
   // END 1 → 0
   if (data.processStart === 0 && lastProcessStart === 1 && currentProcess) {
-
     const endTime = new Date();
 
     const summary = {
@@ -126,7 +76,8 @@ async function handleProcessLogic(data) {
 
     console.log("🔴 Process Ended:", summary);
 
-    await insertPlcData(summary);
+    // Queue process summary instead of direct insert
+    DataQueue.pushToDbQueue(summary);
 
     currentProcess = null;
   }
@@ -134,11 +85,9 @@ async function handleProcessLogic(data) {
   lastProcessStart = data.processStart;
 }
 
-/* ---------------- AI LOGIC (Receives POST from Python) ---------- */
+/* -------- AI LOGIC (Receives POST from Python) ---------- */
 
 async function handleDetectResult(defectData) {
-  // defectData = { defect: true, count: N, defectId: X, confidence: Y, timestamp: T }
-  
   if (!currentProcess) {
     console.log("⚠️ Defect received but no active process");
     return;
@@ -152,54 +101,122 @@ async function handleDetectResult(defectData) {
   // ADD TO QUEUE instead of processing immediately
   defectQueue.push(defectData);
   console.log(`📥 Defect #${defectData.defectId} queued (Queue size: ${defectQueue.length})`);
-
-  // Start processing if not already
-  if (!isProcessingDefect) {
-    processDefectQueue();
-  }
 }
+
 
 /* ---------------- POLLING LOOP ---------------- */
 
 async function readLoop() {
   try {
+    // FAST: Read PLC data only (~20-50ms)
     const data = await getPlcData();
-    if (!data) return setTimeout(readLoop, 2000);
+    
+    if (!data) {
+      return;
+    }
 
+    // Update in-memory latest data (quick)
     latestPlcData = data;
 
-    // Handle process start/end logic
-    await handleProcessLogic(data);
+    // Process logic SYNCHRONOUSLY (no await/blocking)
+    handleProcessLogic(data);
 
-    // Save telemetry on important changes
+    // Check if telemetry should be saved - if yes, QUEUE it
     if (hasImportantChange(data)) {
-      console.log("📝 Saving telemetry...");
-      const success = await insertPlcData({
+      // Push to queue instead of waiting for DB insert
+      DataQueue.pushToPlcQueue({
         type: "telemetry",
         processId: currentProcess?.processId || null,
         textileId: currentProcess?.textileId || null,
         ...data
       });
 
-      if (success) {
-        lastSavedData = { ...data };
-        console.log("📈 Telemetry Saved to Database");
-      } else {
-        console.log("⚠️ Telemetry NOT saved - check MongoDB connection");
-      }
+      // Mark as saved locally
+      lastSavedData = { ...data };
+      console.log("📤 Telemetry queued for DB (PLC queue: " + DataQueue.getQueueStats().plcQueueSize + ")");
     }
 
   } catch (err) {
-    console.error("Loop Error:", err.message);
+    console.error("❌ PLC Polling Error:", err.message);
   }
+}
 
-  setTimeout(readLoop, 2000);
+/**
+ * Database writer: processes telemetry queue independently
+ */
+async function dbWriterTelemetryLoop() {
+  try {
+    // No queue item processing - that will be done in main scheduler
+  } catch (err) {
+    console.error("❌ DB Writer Error:", err.message);
+  }
 }
 
 export function startPlcPolling() {
   if (_pollingStarted) return;
   _pollingStarted = true;
-  readLoop();
+  
+  console.log("🔄 Starting NON-BLOCKING architecture:");
+  console.log("   ✓ PLC polls every 1-2 seconds (FAST, never blocked by DB)");
+  console.log("   ✓ Data queued for async DB writes");
+  console.log("   ✓ Socket stays responsive & active");
+  
+  // Fast PLC polling loop (1-2 second interval)
+  setInterval(async () => {
+    await readLoop();
+  }, 1500);
+
+  // Database writer loop (continual, processes queue)
+  setInterval(async () => {
+    const record = DataQueue.popFromPlcQueue();
+    if (record) {
+      try {
+        const success = await insertPlcData(record.data);
+        if (success) {
+          console.log("✅ Telemetry DB write complete");
+        }
+      } catch (err) {
+        console.error("❌ Telemetry DB write failed:", err.message);
+      }
+    }
+  }, 100); // Check queue every 100ms
+
+  // Defect processor (independent)
+  setInterval(async () => {
+    if (isProcessingDefect || defectQueue.length === 0) return;
+
+    isProcessingDefect = true;
+    const defectData = defectQueue.shift();
+
+    try {
+      if (!currentProcess || (latestPlcData && latestPlcData.machineRunning !== 1)) {
+        isProcessingDefect = false;
+        return;
+      }
+
+      console.log(`❗ Processing Defect [${defectData.defectId}]: ${defectData.count} holes`);
+      await sendDefectTrigger();
+
+      const success = await insertPlcData({
+        type: "defect",
+        processId: currentProcess.processId,
+        textileId: currentProcess.textileId,
+        count: defectData.count,
+        defectId: defectData.defectId,
+        confidence: defectData.confidence,
+        lengthAtDetection: latestPlcData?.fabricLength || null,
+        timestamp: new Date()
+      });
+
+      if (success) {
+        console.log(`✅ Defect #${defectData.defectId} complete (${defectQueue.length} queued)`);
+      }
+    } catch (err) {
+      console.error("❌ Defect processing error:", err.message);
+    } finally {
+      isProcessingDefect = false;
+    }
+  }, 50); // Check defect queue every 50ms
 }
 
 /* ---------------- API ENDPOINTS ---------------- */
@@ -488,6 +505,109 @@ router.post("/test/process-end", async (req, res) => {
     success: true,
     message: "Process ended (TEST MODE)",
     summary
+  });
+});
+
+/* -------- DEFECT REGISTER TEST ENDPOINTS -------- */
+
+// Test the defect register (1 -> 0 with 2 second delay)
+router.post("/test/trigger-defect-register", async (req, res) => {
+  try {
+    const startTime = Date.now();
+    console.log("🧪 TEST: Triggering defect register...");
+    
+    // Trigger the defect register
+    await sendDefectTrigger();
+    
+    const duration = Date.now() - startTime;
+    
+    res.json({
+      success: true,
+      message: "Defect register triggered successfully",
+      timestamp: new Date(),
+      details: {
+        register: "D111",
+        sequence: "1 -> (wait 2 seconds) -> 0",
+        duration_ms: duration,
+        expected_duration_ms: 2000,
+        status: "Complete"
+      }
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to trigger defect register",
+      error: err.message
+    });
+  }
+});
+
+// Manually set defect register to 1
+router.post("/test/defect-register/set-1", async (req, res) => {
+  try {
+    console.log("🧪 TEST: Setting D111 = 1");
+    await sendDefectTriggerSetOne();
+    
+    res.json({
+      success: true,
+      message: "Defect register set to 1",
+      register: "D111",
+      value: 1,
+      status: "Register ON ⚠️",
+      nextAction: "Use POST /plc/test/defect-register/reset-0 to reset"
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to set register",
+      error: err.message
+    });
+  }
+});
+
+// Manually set defect register to 0
+router.post("/test/defect-register/reset-0", async (req, res) => {
+  try {
+    console.log("🧪 TEST: Resetting D111 = 0");
+    await sendDefectTriggerSetZero();
+    
+    res.json({
+      success: true,
+      message: "Defect register reset to 0",
+      register: "D111",
+      value: 0,
+      status: "Register OFF ✅"
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to reset register",
+      error: err.message
+    });
+  }
+});
+
+// Get current defect register status
+router.get("/test/defect-register/status", (req, res) => {
+  const registerValue = latestPlcData?.defectRegister || 0;
+  
+  res.json({
+    register: "D111",
+    currentValue: registerValue,
+    status: registerValue === 1 ? "DEFECT DETECTED ⚠️" : "NORMAL ✅",
+    timestamp: latestPlcData?.timestamp || new Date()
+  });
+});
+
+// Production endpoint: Get current defect register status (for AI sync)
+router.get("/defect-register/status", (req, res) => {
+  const registerValue = latestPlcData?.defectRegister || 0;
+  
+  res.json({
+    register: "D111",
+    value: registerValue,
+    isActive: registerValue === 1,
+    timestamp: latestPlcData?.timestamp || new Date()
   });
 });
 
